@@ -52,9 +52,9 @@ func (s *Web) Serve() error {
 	ln, err := net.Listen("tcp", addr)
 	s.ln = ln
 	if err != nil {
-		return errors.Wrap(err, "Failed to web listen to tcp connection")
+		return errors.Wrap(err, "failed to web listen to tcp connection")
 	}
-	log.Infof("Serving Web at %v", addr)
+	log.Infof("serving web at %v", addr)
 	return http.Serve(s.ln, s.handler)
 }
 
@@ -63,9 +63,9 @@ func (s *Web) RegisterProvider(n string, h func(http.ResponseWriter, *http.Reque
 }
 
 func (s *Web) Close() {
-	log.Info("Closing Web")
+	log.Info("closing web")
 	defer func() {
-		log.Info("Web closed")
+		log.Info("web closed")
 	}()
 	if s.ln != nil {
 		s.ln.Close()

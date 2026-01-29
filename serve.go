@@ -22,6 +22,7 @@ func configureServe(c *cli.Command) {
 	c.Flags = s.RegisterWebFlags([]cli.Flag{})
 	c.Flags = cs.RegisterProbeFlags(c.Flags)
 	c.Flags = s.RegisterPatreonFlags(c.Flags)
+	c.Flags = s.RegisterNATSFlags(c.Flags)
 	c.Flags = cs.RegisterPGFlags(c.Flags)
 }
 
@@ -37,6 +38,12 @@ func serve(c *cli.Context) error {
 		return err
 	}
 
+	// Setting NATS
+	nats := s.NewNATS(c)
+	if nats != nil {
+		defer nats.Close()
+	}
+
 	// Setting ProbeService
 	probe := cs.NewProbe(c)
 	defer probe.Close()
@@ -46,7 +53,8 @@ func serve(c *cli.Context) error {
 	defer web.Close()
 
 	// Setting Patreon
-	patreon := s.NewPatreon(c, db)
+	patreon := s.NewPatreon(c, db, nats)
+	defer patreon.Close()
 
 	// Registering Patreon handler
 	web.RegisterProvider("/patreon", patreon.Handle)
@@ -57,7 +65,7 @@ func serve(c *cli.Context) error {
 	// And SERVE!
 	err = serve.Serve()
 	if err != nil {
-		log.WithError(err).Error("Got server error")
+		log.WithError(err).Error("got server error")
 	}
 	return err
 }

@@ -33,12 +33,14 @@ func RegisterPatreonFlags(f []cli.Flag) []cli.Flag {
 type Patreon struct {
 	db     *cs.PG
 	secret string
+	nats   *NATS
 }
 
-func NewPatreon(c *cli.Context, db *cs.PG) *Patreon {
+func NewPatreon(c *cli.Context, db *cs.PG, nats *NATS) *Patreon {
 	return &Patreon{
 		secret: c.String(patreonSecretFlag),
 		db:     db,
+		nats:   nats,
 	}
 }
 
@@ -48,7 +50,7 @@ func (s *Patreon) Handle(w http.ResponseWriter, r *http.Request) {
 	defer b.Close()
 	bb, err := ioutil.ReadAll(b)
 	if err != nil {
-		log.WithError(err).Error("Failed to read request body")
+		log.WithError(err).Error("failed to read request body")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -58,22 +60,22 @@ func (s *Patreon) Handle(w http.ResponseWriter, r *http.Request) {
 		WithField("payload_len", len(bb)).
 		WithField("event", event).
 		WithField("signature", signature).
-		Info("Request received")
+		Info("request received")
 	var p mp.Payload
 	err = json.Unmarshal(bb, &p)
 	if err != nil {
-		log.WithError(err).Errorf("Failed to unmarshal request body=%v", bb)
+		log.WithError(err).Errorf("failed to unmarshal request body=%v", bb)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	ds, err := hex.DecodeString(signature)
 	if err != nil {
-		log.WithError(err).Errorf("Failed to decode signature=%v", signature)
+		log.WithError(err).Errorf("failed to decode signature=%v", signature)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	if !s.validate(bb, ds, []byte(s.secret)) {
-		log.Warn("Signature validation failed")
+		log.Warn("signature validation failed")
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -84,12 +86,54 @@ func (s *Patreon) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err = db.Model(m).Insert()
 	if err != nil {
-		log.WithError(err).Errorf("Failed to store patreon message=%+v", m)
+		log.WithError(err).Errorf("failed to store patreon message=%+v", m)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	log.WithField("message", m).Info("Message stored")
+	log.WithField("message", m).Info("message stored")
+	s.publish(p)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Patreon) publish(p mp.Payload) {
+	email := s.getEmail(p)
+	if email == "" {
+		return
+	}
+	if s.nats == nil {
+		log.WithField("email", email).Info("nats service not configured, skipping publish")
+		return
+	}
+	msg := struct {
+		Email string `json:"email"`
+	}{
+		Email: email,
+	}
+	err := s.nats.Publish("user.updated", msg)
+	if err != nil {
+		log.WithError(err).Error("failed to publish to nats")
+		return
+	}
+	log.WithField("email", email).Info("published to nats")
+}
+
+func (s *Patreon) getEmail(p mp.Payload) string {
+	data, ok := p["data"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	attrs, ok := data["attributes"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	email, ok := attrs["email"].(string)
+	if !ok {
+		return ""
+	}
+	return email
+}
+
+func (s *Patreon) Close() {
 }
 
 func (s *Patreon) validate(message, messageMAC, key []byte) bool {
