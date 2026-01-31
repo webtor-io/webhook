@@ -22,7 +22,7 @@ func configureServe(c *cli.Command) {
 	c.Flags = s.RegisterWebFlags([]cli.Flag{})
 	c.Flags = cs.RegisterProbeFlags(c.Flags)
 	c.Flags = s.RegisterPatreonFlags(c.Flags)
-	c.Flags = s.RegisterNATSFlags(c.Flags)
+	c.Flags = cs.RegisterNATSFlags(c.Flags)
 	c.Flags = cs.RegisterPGFlags(c.Flags)
 }
 
@@ -39,7 +39,7 @@ func serve(c *cli.Context) error {
 	}
 
 	// Setting NATS
-	nats := s.NewNATS(c)
+	nats := cs.NewNATS(c)
 	if nats != nil {
 		defer nats.Close()
 	}

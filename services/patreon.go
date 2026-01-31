@@ -33,10 +33,10 @@ func RegisterPatreonFlags(f []cli.Flag) []cli.Flag {
 type Patreon struct {
 	db     *cs.PG
 	secret string
-	nats   *NATS
+	nats   *cs.NATS
 }
 
-func NewPatreon(c *cli.Context, db *cs.PG, nats *NATS) *Patreon {
+func NewPatreon(c *cli.Context, db *cs.PG, nats *cs.NATS) *Patreon {
 	return &Patreon{
 		secret: c.String(patreonSecretFlag),
 		db:     db,
@@ -109,7 +109,17 @@ func (s *Patreon) publish(p mp.Payload) {
 	}{
 		Email: email,
 	}
-	err := s.nats.Publish("user.updated", msg)
+	b, err := json.Marshal(msg)
+	if err != nil {
+		log.WithError(err).Error("failed to marshal nats message")
+		return
+	}
+	nc := s.nats.Get()
+	if nc == nil {
+		log.Error("failed to get nats connection")
+		return
+	}
+	err = nc.Publish("user.updated", b)
 	if err != nil {
 		log.WithError(err).Error("failed to publish to nats")
 		return

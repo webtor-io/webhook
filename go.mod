@@ -3,11 +3,12 @@ module github.com/webtor-io/webhook
 go 1.25
 
 require (
+	github.com/nats-io/nats.go v1.48.0
 	github.com/pkg/errors v0.9.1
 	github.com/satori/go.uuid v1.2.0
 	github.com/sirupsen/logrus v1.9.4
 	github.com/urfave/cli v1.22.17
-	github.com/webtor-io/common-services v0.0.0-20251108105453-635ef47a01ea
+	github.com/webtor-io/common-services v0.0.0-20260131122210-5178e4b36a70
 )
 
 require (
@@ -24,7 +25,6 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/nats-io/nats.go v1.48.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
