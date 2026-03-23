@@ -7,7 +7,7 @@ require (
 	github.com/satori/go.uuid v1.2.0
 	github.com/sirupsen/logrus v1.9.4
 	github.com/urfave/cli v1.22.17
-	github.com/webtor-io/common-services v0.0.0-20260322130032-a73c9cd1d929
+	github.com/webtor-io/common-services v0.0.0-20260323102409-3db3157d4ec9
 )
 
 require (
