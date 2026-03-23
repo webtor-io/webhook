@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"io/ioutil"
 	"net/http"
 
@@ -85,6 +86,10 @@ func (s *Patreon) Handle(w http.ResponseWriter, r *http.Request) {
 		Signature: ds,
 	}
 	_, err = db.Model(m).Insert()
+	if err != nil && (err == io.EOF || err.Error() == "EOF") {
+		log.WithError(err).Warn("got EOF on insert, retrying")
+		_, err = db.Model(m).Insert()
+	}
 	if err != nil {
 		log.WithError(err).Errorf("failed to store patreon message=%+v", m)
 		w.WriteHeader(http.StatusInternalServerError)
