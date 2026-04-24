@@ -8,5 +8,6 @@ import (
 func configure(app *cli.App) {
 	pgMigrationCmd := cs.MakePGMigrationCMD()
 	serveCmd := makeServeCMD()
-	app.Commands = []cli.Command{serveCmd, pgMigrationCmd}
+	refreshCmd := makeRefreshMembersCMD()
+	app.Commands = []cli.Command{serveCmd, pgMigrationCmd, refreshCmd}
 }

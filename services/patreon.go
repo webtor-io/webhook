@@ -1,11 +1,15 @@
 package services
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
+	"sync"
+	"time"
 
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	cs "github.com/webtor-io/common-services"
@@ -16,7 +20,9 @@ import (
 )
 
 const (
-	patreonSecretFlag = "patreon-secret"
+	patreonSecretFlag  = "patreon-secret"
+	refreshMembersStmt = `REFRESH MATERIALIZED VIEW CONCURRENTLY patreon."member"`
+	refreshTimeout     = 2 * time.Minute
 )
 
 func RegisterPatreonFlags(f []cli.Flag) []cli.Flag {
@@ -34,6 +40,11 @@ type Patreon struct {
 	db     *cs.PG
 	secret string
 	nats   *cs.NATS
+
+	refreshMu      sync.Mutex
+	refreshRunning bool
+	refreshPending bool
+	refreshWaiters []chan struct{}
 }
 
 func NewPatreon(c *cli.Context, db *cs.PG, nats *cs.NATS) *Patreon {
@@ -91,8 +102,73 @@ func (s *Patreon) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.WithField("message", m).Info("message stored")
-	s.publish(p)
 	w.WriteHeader(http.StatusOK)
+	s.scheduleRefreshAndPublish(p)
+}
+
+// scheduleRefreshAndPublish queues a background refresh of patreon.member and
+// publishes user.updated once the refresh completes. Concurrent calls coalesce
+// into at most one running + one pending refresh.
+func (s *Patreon) scheduleRefreshAndPublish(p mp.Payload) {
+	done := make(chan struct{})
+
+	s.refreshMu.Lock()
+	s.refreshWaiters = append(s.refreshWaiters, done)
+	startWorker := !s.refreshRunning
+	if s.refreshRunning {
+		s.refreshPending = true
+	} else {
+		s.refreshRunning = true
+	}
+	s.refreshMu.Unlock()
+
+	if startWorker {
+		go s.refreshLoop()
+	}
+	go func() {
+		<-done
+		s.publish(p)
+	}()
+}
+
+func (s *Patreon) refreshLoop() {
+	for {
+		if err := s.RefreshMembers(context.Background()); err != nil {
+			log.WithError(err).Error("failed to refresh patreon.member")
+		} else {
+			log.Info("patreon.member refreshed")
+		}
+
+		s.refreshMu.Lock()
+		waiters := s.refreshWaiters
+		s.refreshWaiters = nil
+		again := s.refreshPending
+		s.refreshPending = false
+		if !again {
+			s.refreshRunning = false
+		}
+		s.refreshMu.Unlock()
+
+		for _, w := range waiters {
+			close(w)
+		}
+		if !again {
+			return
+		}
+	}
+}
+
+// RefreshMembers runs REFRESH MATERIALIZED VIEW CONCURRENTLY on patreon.member.
+// Exported so the CLI `refresh-members` subcommand can call it.
+func (s *Patreon) RefreshMembers(ctx context.Context) error {
+	db := s.db.Get()
+	if db == nil {
+		return errors.New("db not available")
+	}
+	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
+	defer cancel()
+	_, err := db.ExecContext(ctx, refreshMembersStmt)
+	return err
 }
 
 func (s *Patreon) publish(p mp.Payload) {
