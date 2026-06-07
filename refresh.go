@@ -15,7 +15,7 @@ func makeRefreshMembersCMD() cli.Command {
 		Usage:  "Refreshes patreon.member materialized view",
 		Action: refreshMembers,
 	}
-	cmd.Flags = cs.RegisterPGFlags([]cli.Flag{})
+	cmd.Flags = s.RegisterPatreonFlags(cs.RegisterPGFlags([]cli.Flag{}))
 	return cmd
 }
 

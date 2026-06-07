@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	patreonSecretFlag  = "patreon-secret"
-	refreshMembersStmt = `REFRESH MATERIALIZED VIEW CONCURRENTLY patreon."member"`
-	refreshTimeout     = 2 * time.Minute
+	patreonSecretFlag     = "patreon-secret"
+	refreshTimeoutFlag    = "patreon-refresh-timeout"
+	refreshMembersStmt    = `REFRESH MATERIALIZED VIEW CONCURRENTLY patreon."member"`
+	defaultRefreshTimeout = 5 * time.Minute
 )
 
 func RegisterPatreonFlags(f []cli.Flag) []cli.Flag {
@@ -33,6 +34,12 @@ func RegisterPatreonFlags(f []cli.Flag) []cli.Flag {
 			Value:  "",
 			EnvVar: "PATREON_SECRET",
 		},
+		cli.DurationFlag{
+			Name:   refreshTimeoutFlag,
+			Usage:  "timeout for REFRESH MATERIALIZED VIEW CONCURRENTLY patreon.member; raise if the view grows large enough to exceed it",
+			Value:  defaultRefreshTimeout,
+			EnvVar: "PATREON_REFRESH_TIMEOUT",
+		},
 	)
 }
 
@@ -41,6 +48,8 @@ type Patreon struct {
 	secret string
 	nats   *cs.NATS
 
+	refreshTimeout time.Duration
+
 	refreshMu      sync.Mutex
 	refreshRunning bool
 	refreshPending bool
@@ -48,10 +57,15 @@ type Patreon struct {
 }
 
 func NewPatreon(c *cli.Context, db *cs.PG, nats *cs.NATS) *Patreon {
+	to := c.Duration(refreshTimeoutFlag)
+	if to <= 0 {
+		to = defaultRefreshTimeout
+	}
 	return &Patreon{
-		secret: c.String(patreonSecretFlag),
-		db:     db,
-		nats:   nats,
+		secret:         c.String(patreonSecretFlag),
+		db:             db,
+		nats:           nats,
+		refreshTimeout: to,
 	}
 }
 
@@ -165,7 +179,7 @@ func (s *Patreon) RefreshMembers(ctx context.Context) error {
 	if db == nil {
 		return errors.New("db not available")
 	}
-	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.refreshTimeout)
 	defer cancel()
 	_, err := db.ExecContext(ctx, refreshMembersStmt)
 	return err
