@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-pg/pg/v10"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
@@ -23,7 +24,13 @@ const (
 	patreonSecretFlag     = "patreon-secret"
 	refreshTimeoutFlag    = "patreon-refresh-timeout"
 	refreshMembersStmt    = `REFRESH MATERIALIZED VIEW CONCURRENTLY patreon."member"`
-	defaultRefreshTimeout = 5 * time.Minute
+	defaultRefreshTimeout = 10 * time.Minute
+	// memberRefreshLockKey is an arbitrary fixed key for the session-level
+	// advisory lock that serialises patreon.member refreshes across processes
+	// (the realtime webhook pod and the periodic refresh-members cron). It keeps
+	// the two from queuing behind each other on the matview's own CONCURRENTLY
+	// lock and blowing the refresh timeout under load.
+	memberRefreshLockKey int64 = 0x70617472 // "patr"
 )
 
 func RegisterPatreonFlags(f []cli.Flag) []cli.Flag {
@@ -172,17 +179,66 @@ func (s *Patreon) refreshLoop() {
 	}
 }
 
-// RefreshMembers runs REFRESH MATERIALIZED VIEW CONCURRENTLY on patreon.member.
-// Exported so the CLI `refresh-members` subcommand can call it.
+// RefreshMembers runs REFRESH MATERIALIZED VIEW CONCURRENTLY on patreon.member,
+// waiting for any in-flight refresh to finish first. Used by the realtime
+// webhook path, which must observe the message it just inserted before it
+// publishes user.updated.
 func (s *Patreon) RefreshMembers(ctx context.Context) error {
+	_, err := s.refreshMembers(ctx, true)
+	return err
+}
+
+// RefreshMembersIfIdle refreshes patreon.member only when no other refresh is
+// running; otherwise it skips and returns false. Used by the periodic
+// refresh-members cron so it never queues behind the realtime refresh on the
+// matview's CONCURRENTLY lock (the in-flight refresh already brings the view up
+// to date).
+func (s *Patreon) RefreshMembersIfIdle(ctx context.Context) (bool, error) {
+	return s.refreshMembers(ctx, false)
+}
+
+// refreshMembers serialises patreon.member refreshes across processes with a
+// session-level advisory lock held on a single pooled connection. With wait,
+// it blocks until the lock is free; without, it tries the lock and returns
+// (false, nil) when another refresh holds it.
+func (s *Patreon) refreshMembers(ctx context.Context, wait bool) (bool, error) {
 	db := s.db.Get()
 	if db == nil {
-		return errors.New("db not available")
+		return false, errors.New("db not available")
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.refreshTimeout)
 	defer cancel()
-	_, err := db.ExecContext(ctx, refreshMembersStmt)
-	return err
+
+	// REFRESH ... CONCURRENTLY cannot run inside a transaction, so the advisory
+	// lock and the refresh must share one connection from the pool.
+	conn := db.Conn()
+	defer conn.Close()
+
+	if wait {
+		if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock(?)", memberRefreshLockKey); err != nil {
+			return false, errors.Wrap(err, "failed to acquire member refresh lock")
+		}
+	} else {
+		var locked bool
+		if _, err := conn.QueryOneContext(ctx, pg.Scan(&locked), "SELECT pg_try_advisory_lock(?)", memberRefreshLockKey); err != nil {
+			return false, errors.Wrap(err, "failed to try member refresh lock")
+		}
+		if !locked {
+			return false, nil
+		}
+	}
+	// Release on the same connection with a fresh context so a refresh that hit
+	// its timeout still unlocks before the connection returns to the pool.
+	defer func() {
+		if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock(?)", memberRefreshLockKey); err != nil {
+			log.WithError(err).Error("failed to release member refresh lock")
+		}
+	}()
+
+	if _, err := conn.ExecContext(ctx, refreshMembersStmt); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Patreon) publish(p mp.Payload) {
