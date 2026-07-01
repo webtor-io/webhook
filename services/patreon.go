@@ -59,7 +59,6 @@ type Patreon struct {
 
 	refreshMu      sync.Mutex
 	refreshRunning bool
-	refreshPending bool
 	refreshWaiters []chan struct{}
 }
 
@@ -136,11 +135,7 @@ func (s *Patreon) scheduleRefreshAndPublish(p mp.Payload) {
 	s.refreshMu.Lock()
 	s.refreshWaiters = append(s.refreshWaiters, done)
 	startWorker := !s.refreshRunning
-	if s.refreshRunning {
-		s.refreshPending = true
-	} else {
-		s.refreshRunning = true
-	}
+	s.refreshRunning = true
 	s.refreshMu.Unlock()
 
 	if startWorker {
@@ -154,28 +149,33 @@ func (s *Patreon) scheduleRefreshAndPublish(p mp.Payload) {
 
 func (s *Patreon) refreshLoop() {
 	for {
+		// Snapshot the waiters BEFORE the refresh: only requests whose message
+		// rows were inserted before this refresh starts are guaranteed to be
+		// reflected in the refreshed matview. Waiters that arrive while the
+		// refresh runs must not be signalled by it — they inserted after the
+		// refresh's snapshot and are handled by the next iteration.
+		s.refreshMu.Lock()
+		waiters := s.refreshWaiters
+		s.refreshWaiters = nil
+		s.refreshMu.Unlock()
+
 		if err := s.RefreshMembers(context.Background()); err != nil {
 			log.WithError(err).Error("failed to refresh patreon.member")
 		} else {
 			log.Info("patreon.member refreshed")
 		}
 
-		s.refreshMu.Lock()
-		waiters := s.refreshWaiters
-		s.refreshWaiters = nil
-		again := s.refreshPending
-		s.refreshPending = false
-		if !again {
-			s.refreshRunning = false
-		}
-		s.refreshMu.Unlock()
-
 		for _, w := range waiters {
 			close(w)
 		}
-		if !again {
+
+		s.refreshMu.Lock()
+		if len(s.refreshWaiters) == 0 {
+			s.refreshRunning = false
+			s.refreshMu.Unlock()
 			return
 		}
+		s.refreshMu.Unlock()
 	}
 }
 
