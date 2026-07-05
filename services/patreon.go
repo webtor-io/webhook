@@ -21,10 +21,14 @@ import (
 )
 
 const (
-	patreonSecretFlag     = "patreon-secret"
-	refreshTimeoutFlag    = "patreon-refresh-timeout"
-	refreshMembersStmt    = `REFRESH MATERIALIZED VIEW CONCURRENTLY patreon."member"`
-	defaultRefreshTimeout = 10 * time.Minute
+	patreonSecretFlag        = "patreon-secret"
+	refreshTimeoutFlag       = "patreon-refresh-timeout"
+	refreshRetriesFlag       = "patreon-refresh-retries"
+	refreshRetryDelayFlag    = "patreon-refresh-retry-delay"
+	refreshMembersStmt       = `REFRESH MATERIALIZED VIEW CONCURRENTLY patreon."member"`
+	defaultRefreshTimeout    = 10 * time.Minute
+	defaultRefreshRetries    = 2
+	defaultRefreshRetryDelay = 30 * time.Second
 	// memberRefreshLockKey is an arbitrary fixed key for the session-level
 	// advisory lock that serialises patreon.member refreshes across processes
 	// (the realtime webhook pod and the periodic refresh-members cron). It keeps
@@ -47,6 +51,18 @@ func RegisterPatreonFlags(f []cli.Flag) []cli.Flag {
 			Value:  defaultRefreshTimeout,
 			EnvVar: "PATREON_REFRESH_TIMEOUT",
 		},
+		cli.IntFlag{
+			Name:   refreshRetriesFlag,
+			Usage:  "extra attempts for the periodic patreon.member refresh after a failed one (0 disables retries)",
+			Value:  defaultRefreshRetries,
+			EnvVar: "PATREON_REFRESH_RETRIES",
+		},
+		cli.DurationFlag{
+			Name:   refreshRetryDelayFlag,
+			Usage:  "delay between patreon.member refresh attempts",
+			Value:  defaultRefreshRetryDelay,
+			EnvVar: "PATREON_REFRESH_RETRY_DELAY",
+		},
 	)
 }
 
@@ -55,7 +71,9 @@ type Patreon struct {
 	secret string
 	nats   *cs.NATS
 
-	refreshTimeout time.Duration
+	refreshTimeout    time.Duration
+	refreshRetries    int
+	refreshRetryDelay time.Duration
 
 	refreshMu      sync.Mutex
 	refreshRunning bool
@@ -67,11 +85,21 @@ func NewPatreon(c *cli.Context, db *cs.PG, nats *cs.NATS) *Patreon {
 	if to <= 0 {
 		to = defaultRefreshTimeout
 	}
+	retries := c.Int(refreshRetriesFlag)
+	if retries < 0 {
+		retries = 0
+	}
+	delay := c.Duration(refreshRetryDelayFlag)
+	if delay <= 0 {
+		delay = defaultRefreshRetryDelay
+	}
 	return &Patreon{
-		secret:         c.String(patreonSecretFlag),
-		db:             db,
-		nats:           nats,
-		refreshTimeout: to,
+		secret:            c.String(patreonSecretFlag),
+		db:                db,
+		nats:              nats,
+		refreshTimeout:    to,
+		refreshRetries:    retries,
+		refreshRetryDelay: delay,
 	}
 }
 
@@ -197,6 +225,32 @@ func (s *Patreon) RefreshMembersIfIdle(ctx context.Context) (bool, error) {
 	return s.refreshMembers(ctx, false)
 }
 
+// RefreshMembersIfIdleWithRetry is RefreshMembersIfIdle plus retries, so a
+// single slow refresh or dropped PG connection doesn't fail the whole cron
+// job. Each attempt gets its own refreshTimeout window; a skip (another
+// refresh in progress) returns immediately without retrying.
+func (s *Patreon) RefreshMembersIfIdleWithRetry(ctx context.Context) (bool, error) {
+	var (
+		ran bool
+		err error
+	)
+	for attempt := 0; ; attempt++ {
+		ran, err = s.refreshMembers(ctx, false)
+		if err == nil || attempt >= s.refreshRetries {
+			return ran, err
+		}
+		log.WithError(err).
+			WithField("attempt", attempt+1).
+			WithField("max_attempts", s.refreshRetries+1).
+			Warn("patreon.member refresh failed, retrying")
+		select {
+		case <-ctx.Done():
+			return false, err
+		case <-time.After(s.refreshRetryDelay):
+		}
+	}
+}
+
 // refreshMembers serialises patreon.member refreshes across processes with a
 // session-level advisory lock held on a single pooled connection. With wait,
 // it blocks until the lock is free; without, it tries the lock and returns
@@ -231,7 +285,10 @@ func (s *Patreon) refreshMembers(ctx context.Context, wait bool) (bool, error) {
 	// its timeout still unlocks before the connection returns to the pool.
 	defer func() {
 		if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock(?)", memberRefreshLockKey); err != nil {
-			log.WithError(err).Error("failed to release member refresh lock")
+			// A conn broken by a failed refresh can't run the unlock, but the
+			// session-level lock is released server-side when conn.Close ends
+			// the session, so this is not a stuck-lock condition.
+			log.WithError(err).Warn("failed to release member refresh lock (lock released by connection close)")
 		}
 	}()
 

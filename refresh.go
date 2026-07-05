@@ -26,7 +26,7 @@ func refreshMembers(c *cli.Context) error {
 	p := s.NewPatreon(c, db, nil)
 	defer p.Close()
 
-	ran, err := p.RefreshMembersIfIdle(context.Background())
+	ran, err := p.RefreshMembersIfIdleWithRetry(context.Background())
 	if err != nil {
 		log.WithError(err).Error("failed to refresh patreon.member")
 		return err
