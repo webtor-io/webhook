@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-pg/pg/v10"
 	uuid "github.com/satori/go.uuid"
@@ -49,6 +50,7 @@ func NewInvoice(db *cs.PG, providers map[string]InvoiceProvider) *Invoice {
 func (s *Invoice) RegisterHandlers(web *Web) {
 	web.RegisterProvider("PUT /invoice/{id}", s.handlePut)
 	web.RegisterProvider("GET /invoice/{id}", s.handleGet)
+	web.RegisterProvider("GET /invoices", s.handleList)
 	web.RegisterProvider("GET /prices", s.handlePrices)
 }
 
@@ -213,6 +215,51 @@ func (s *Invoice) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, invoiceResponseFromPayment(p))
+}
+
+type listInvoicesResponse struct {
+	Invoices []invoiceListItem `json:"invoices"`
+}
+
+type invoiceListItem struct {
+	ID          string    `json:"id" pg:"id"`
+	Provider    string    `json:"provider" pg:"provider"`
+	Status      string    `json:"status" pg:"status"`
+	TierID      int       `json:"tier_id" pg:"tier_id"`
+	TierName    string    `json:"tier_name" pg:"tier_name"`
+	PeriodDays  int       `json:"period_days" pg:"period_days"`
+	AmountUSD   float64   `json:"amount_usd" pg:"amount_usd"`
+	PayCurrency string    `json:"pay_currency" pg:"pay_currency"`
+	URL         string    `json:"url" pg:"url"`
+	CreatedAt   time.Time `json:"created_at" pg:"created_at"`
+}
+
+// handleList returns the payment history of one user, newest first.
+func (s *Invoice) handleList(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	db := s.db.Get()
+	items := []invoiceListItem{}
+	_, err := db.Query(&items, `
+		SELECT p.payment_id::text AS id, p.provider, p.status, p.tier_id,
+		       COALESCE(t.name, '') AS tier_name, p.period_days, p.amount_usd,
+		       COALESCE(p.pay_currency, '') AS pay_currency,
+		       COALESCE(p.invoice_url, '') AS url, p.created_at
+		FROM billing.payment p
+		LEFT JOIN tier t ON t.tier_id = p.tier_id
+		WHERE p.user_id = ?
+		ORDER BY p.created_at DESC
+		LIMIT 100
+	`, userID)
+	if err != nil {
+		log.WithError(err).Error("failed to select payments")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, listInvoicesResponse{Invoices: items})
 }
 
 type listPricesResponse struct {

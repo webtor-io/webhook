@@ -24,6 +24,7 @@ request (`"provider": "nowpayments"` for now, dispatched via the
   double-charge). Body: `provider`, `user_id`, `email`, `tier_id`,
   `period_days`; the amount always comes from the `price` table.
 - `GET /invoice/{id}` — payment state.
+- `GET /invoices?user_id=` — one user's payment history, newest first.
 - `GET /prices` — purchasable (tier, period, amount) plans.
 
 These routes carry no auth (cluster-internal, matching the other webtor
