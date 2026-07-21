@@ -63,6 +63,7 @@ type putInvoiceRequest struct {
 type invoiceResponse struct {
 	ID         string  `json:"id"`
 	Provider   string  `json:"provider"`
+	UserID     string  `json:"user_id"`
 	Status     string  `json:"status"`
 	TierID     int     `json:"tier_id"`
 	PeriodDays int     `json:"period_days"`
@@ -74,6 +75,7 @@ func invoiceResponseFromPayment(p *mb.Payment) invoiceResponse {
 	return invoiceResponse{
 		ID:         p.ID.String(),
 		Provider:   p.Provider,
+		UserID:     p.UserID,
 		Status:     p.Status,
 		TierID:     p.TierID,
 		PeriodDays: p.PeriodDays,
