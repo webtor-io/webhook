@@ -299,35 +299,7 @@ func (s *Patreon) refreshMembers(ctx context.Context, wait bool) (bool, error) {
 }
 
 func (s *Patreon) publish(p mp.Payload) {
-	email := s.getEmail(p)
-	if email == "" {
-		return
-	}
-	if s.nats == nil {
-		log.WithField("email", email).Info("nats service not configured, skipping publish")
-		return
-	}
-	msg := struct {
-		Email string `json:"email"`
-	}{
-		Email: email,
-	}
-	b, err := json.Marshal(msg)
-	if err != nil {
-		log.WithError(err).Error("failed to marshal nats message")
-		return
-	}
-	nc := s.nats.Get()
-	if nc == nil {
-		log.Error("failed to get nats connection")
-		return
-	}
-	err = nc.Publish("user.updated", b)
-	if err != nil {
-		log.WithError(err).Error("failed to publish to nats")
-		return
-	}
-	log.WithField("email", email).Info("published to nats")
+	publishUserUpdated(s.nats, s.getEmail(p))
 }
 
 func (s *Patreon) getEmail(p mp.Payload) string {

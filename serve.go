@@ -22,6 +22,7 @@ func configureServe(c *cli.Command) {
 	c.Flags = s.RegisterWebFlags([]cli.Flag{})
 	c.Flags = cs.RegisterProbeFlags(c.Flags)
 	c.Flags = s.RegisterPatreonFlags(c.Flags)
+	c.Flags = s.RegisterNowPaymentsFlags(c.Flags)
 	c.Flags = cs.RegisterNATSFlags(c.Flags)
 	c.Flags = cs.RegisterPGFlags(c.Flags)
 }
@@ -58,6 +59,20 @@ func serve(c *cli.Context) error {
 
 	// Registering Patreon handler
 	web.RegisterProvider("/patreon", patreon.Handle)
+
+	// Setting NOWPayments
+	np := s.NewNowPayments(c, db, nats)
+	defer np.Close()
+
+	// Registering the NOWPayments IPN receiver (public, like /patreon)
+	web.RegisterProvider("/nowpayments", np.HandleIPN)
+
+	// Setting the provider-agnostic invoice API (cluster-only: the ingress
+	// path whitelist is what keeps these routes off the internet)
+	invoice := s.NewInvoice(db, map[string]s.InvoiceProvider{
+		"nowpayments": np,
+	})
+	invoice.RegisterHandlers(web)
 
 	// Setting ServeService
 	serve := cs.NewServe(probe, web)
