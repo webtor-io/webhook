@@ -115,6 +115,7 @@ func (s *Invoice) handlePut(w http.ResponseWriter, r *http.Request) {
 	err = db.Model(price).
 		Where("tier_id = ?", req.TierID).
 		Where("period_days = ?", req.PeriodDays).
+		Where("available").
 		Select()
 	if err == pg.ErrNoRows {
 		w.WriteHeader(http.StatusNotFound)
@@ -271,13 +272,14 @@ type priceItem struct {
 	TierName   string  `json:"tier_name" pg:"tier_name"`
 	PeriodDays int     `json:"period_days" pg:"period_days"`
 	AmountUSD  float64 `json:"amount_usd" pg:"amount_usd"`
+	Available  bool    `json:"available" pg:"available"`
 }
 
 func (s *Invoice) handlePrices(w http.ResponseWriter, r *http.Request) {
 	db := s.db.Get()
 	var items []priceItem
 	_, err := db.Query(&items, `
-		SELECT p.tier_id, t.name AS tier_name, p.period_days, p.amount_usd
+		SELECT p.tier_id, t.name AS tier_name, p.period_days, p.amount_usd, p.available
 		FROM price p
 		JOIN tier t ON t.tier_id = p.tier_id
 		ORDER BY p.tier_id, p.period_days

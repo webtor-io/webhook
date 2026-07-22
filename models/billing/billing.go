@@ -51,4 +51,5 @@ type Price struct {
 	TierID     int      `pg:"tier_id,pk,use_zero"`
 	PeriodDays int      `pg:",pk"`
 	AmountUSD  float64  `pg:"amount_usd,notnull"`
+	Available  bool     `pg:",notnull,default:true,use_zero"`
 }
