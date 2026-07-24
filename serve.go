@@ -75,6 +75,9 @@ func serve(c *cli.Context) error {
 	// Registering the lava.top webhook receiver (public, like /patreon)
 	web.RegisterProvider("/lavatop", lt.HandleWebhook)
 
+	// Background check that the storefront offers still resolve to tiers
+	lt.CheckOffers()
+
 	// Setting the provider-agnostic invoice API (cluster-only: the ingress
 	// path whitelist is what keeps these routes off the internet)
 	invoice := s.NewInvoice(db, map[string]s.InvoiceProvider{

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/go-pg/pg/v10"
 	"github.com/pkg/errors"
 	uuid "github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
@@ -132,7 +134,7 @@ func parseLavatopProducts(v string) (map[string]bool, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "malformed product uuid %q", entry)
 		}
-		products[strings.ToLower(id.String())] = true
+		products[id.String()] = true
 	}
 	return products, nil
 }
@@ -234,10 +236,19 @@ func (s *Lavatop) processEvent(ctx context.Context, payload map[string]any) (str
 	}
 }
 
-// lavatop payload status values that mean money actually arrived.
+// lavatop payload status values that mean money actually arrived, and known
+// failure values that legitimately carry no money. A status in NEITHER set on
+// a success event is treated as an error (5xx → lava.top retries): it is most
+// likely a success value this build doesn't know yet, and acking it would
+// silently drop a paid sale.
 var ltSuccessStatuses = map[string]bool{
 	"completed":           true,
 	"subscription-active": true,
+}
+
+var ltFailureStatuses = map[string]bool{
+	"failed":              true,
+	"subscription-failed": true,
 }
 
 func (s *Lavatop) processSuccess(ctx context.Context, payload map[string]any) (string, error) {
@@ -254,12 +265,25 @@ func (s *Lavatop) processSuccess(ctx context.Context, payload map[string]any) (s
 		log.WithField("payload", payload).Warn("lavatop success event without buyer email or contractId, skipping")
 		return "", nil
 	}
-	if !ltSuccessStatuses[status] {
-		log.WithField("status", status).
-			WithField("contract_id", contractID).
-			Warn("lavatop success event with non-success status, skipping")
+	if _, err := uuid.FromString(contractID); err != nil {
+		// Also keeps a crafted contractId out of the fetchContract URL path.
+		log.WithField("contract_id", contractID).Warn("lavatop contractId is not a uuid, skipping")
 		return "", nil
 	}
+	if ltFailureStatuses[status] {
+		// Contradictory success event carrying a failure status — no money.
+		log.WithField("status", status).
+			WithField("contract_id", contractID).
+			Warn("lavatop success event with failure status, skipping")
+		return "", nil
+	}
+	if !ltSuccessStatuses[status] {
+		return "", errors.Errorf("unknown status %q on success event for contract %v", status, contractID)
+	}
+	// A subscription must get its real expiry; only one-time products may use
+	// the fallback period.
+	isSubscription := status == "subscription-active" ||
+		stringField(payload, "eventType") == ltEventRecurringSuccess
 	// 5xx on any failure below → lava.top retries with backoff, which also
 	// rides out the lookup racing the contract becoming visible on their
 	// side. A paid sale must never be ack-and-dropped past this point.
@@ -267,15 +291,60 @@ func (s *Lavatop) processSuccess(ctx context.Context, payload map[string]any) (s
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to fetch contract %v", contractID)
 	}
+	// A renewal's contractId is the child charge contract; when it comes back
+	// without the offer or expiry, fall back to the parent subscription
+	// contract from the payload.
+	parentID := stringField(payload, "parentContractId")
+	if parentID != "" && parentID != contractID &&
+		(contract.OfferName == "" || (isSubscription && contract.ExpiredAt.IsZero())) {
+		if _, err := uuid.FromString(parentID); err == nil {
+			parent, err := s.fetchContract(ctx, parentID)
+			if err != nil {
+				return "", errors.Wrapf(err, "failed to fetch parent contract %v", parentID)
+			}
+			if contract.OfferName == "" {
+				contract.OfferName = parent.OfferName
+			}
+			if contract.ExpiredAt.IsZero() {
+				contract.ExpiredAt = parent.ExpiredAt
+			}
+			if contract.TerminatedAt == "" {
+				contract.TerminatedAt = parent.TerminatedAt
+			}
+		}
+	}
+	if contract.TerminatedAt != "" {
+		// Terminated on the lava.top side (refund/chargeback) before this
+		// (re)delivery was processed — granting now would hand out access for
+		// returned money. Retries won't change it, so ack.
+		log.WithField("contract_id", contractID).
+			WithField("email", email).
+			WithField("terminated_at", contract.TerminatedAt).
+			Warn("lavatop contract terminated, skipping grant")
+		return "", nil
+	}
 	tierName := lavatopTierName(contract.OfferName)
 	if tierName == "" {
 		return "", errors.Errorf("contract %v without offer name, cannot resolve tier", contractID)
 	}
 	expireAt := contract.ExpiredAt
 	if expireAt.IsZero() {
+		if isSubscription {
+			// Not yet populated on the lava.top side — 5xx and let the retry
+			// ladder deliver the real expiry; a fallback grant here would ack
+			// e.g. a yearly purchase with a month of access, unrepaired until
+			// the renewal a year away.
+			return "", errors.Errorf("subscription contract %v without expiry", contractID)
+		}
+		// One-time product: no expiry by design. Anchor the fallback to the
+		// event timestamp, not time.Now(), so redeliveries converge.
+		ts, err := time.Parse(time.RFC3339Nano, stringField(payload, "timestamp"))
+		if err != nil {
+			return "", errors.Wrapf(err, "cannot anchor fallback grant for contract %v", contractID)
+		}
 		log.WithField("contract_id", contractID).
-			Warnf("lavatop contract without subscription expiry, granting %d days", ltFallbackDays)
-		expireAt = time.Now().Add(ltFallbackDays * 24 * time.Hour)
+			Warnf("lavatop contract without expiry, granting %d days", ltFallbackDays)
+		expireAt = ts.Add(ltFallbackDays * 24 * time.Hour)
 	}
 	expireAt = expireAt.Add(time.Duration(s.graceDays) * 24 * time.Hour)
 	db := s.db.Get()
@@ -302,15 +371,16 @@ func (s *Lavatop) processSuccess(ctx context.Context, payload map[string]any) (s
 	return email, nil
 }
 
+// ltWordRe matches the first \w+ run, mirroring the PG substring() call in
+// the patreon.member matview.
+var ltWordRe = regexp.MustCompile(`\w+`)
+
 // lavatopTierName maps an offer name to a tier table name by its first word —
-// "Bronze Backer" → "bronze" — the same convention the patreon.member matview
-// applies to Patreon tier titles (see manual_ddl_snapshot.sql).
+// "Bronze Backer" → "bronze" — the same lower(substring(name, '\w+'))
+// convention the patreon.member matview applies to Patreon tier titles (see
+// manual_ddl_snapshot.sql).
 func lavatopTierName(offerName string) string {
-	fields := strings.Fields(offerName)
-	if len(fields) == 0 {
-		return ""
-	}
-	return strings.ToLower(fields[0])
+	return strings.ToLower(ltWordRe.FindString(offerName))
 }
 
 // lavatopContract is what we need from an InvoiceResponseV2/V3 contract.
@@ -320,6 +390,9 @@ type lavatopContract struct {
 	// ExpiredAt is subscriptionDetails.expiredAt; zero when the contract
 	// carries none (one-time product).
 	ExpiredAt time.Time
+	// TerminatedAt is subscriptionDetails.terminatedAt verbatim; non-empty
+	// means access was closed on the lava.top side (refund/chargeback).
+	TerminatedAt string
 }
 
 // fetchContract looks the contract up at lava.top.
@@ -354,7 +427,8 @@ func extractContract(body []byte) (*lavatopContract, error) {
 		return nil, errors.Wrapf(err, "failed to unmarshal contract response=%v", string(body))
 	}
 	c := &lavatopContract{
-		OfferName: nestedString(out, "product", "offer"),
+		OfferName:    nestedString(out, "product", "offer"),
+		TerminatedAt: nestedString(out, "subscriptionDetails", "terminatedAt"),
 	}
 	v := nestedString(out, "subscriptionDetails", "expiredAt")
 	if v == "" {
@@ -366,6 +440,104 @@ func extractContract(body []byte) (*lavatopContract, error) {
 	}
 	c.ExpiredAt = t
 	return c, nil
+}
+
+// CheckOffers verifies in the background that every offer of the configured
+// products resolves to a tier row, so a dashboard rename is caught at deploy
+// time instead of at the first paid sale. Non-fatal: the webhook service also
+// serves Patreon/NOWPayments and must come up even when lava.top is down.
+func (s *Lavatop) CheckOffers() {
+	if s.apiKey == "" || len(s.products) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), ltAPITimeout)
+		defer cancel()
+		names, err := s.fetchOfferNames(ctx)
+		if err != nil {
+			log.WithError(err).Error("failed to check lavatop offers against tiers")
+			return
+		}
+		db := s.db.Get()
+		ok := true
+		for _, name := range names {
+			tierName := lavatopTierName(name)
+			var exists bool
+			if _, err := db.QueryContext(ctx, pg.Scan(&exists),
+				"SELECT EXISTS(SELECT 1 FROM tier WHERE name = ?)", tierName); err != nil {
+				log.WithError(err).Error("failed to check lavatop offer tier")
+				return
+			}
+			if !exists {
+				ok = false
+				log.WithField("offer", name).
+					WithField("tier", tierName).
+					Error("lavatop offer does not resolve to a tier — grants for it WILL fail; fix the offer name in the lava.top dashboard or the tier table")
+			}
+		}
+		if ok {
+			log.WithField("offers", len(names)).Info("lavatop offers resolve to tiers")
+		}
+	}()
+}
+
+// fetchOfferNames lists the offer names of the configured products from the
+// lava.top products API (tolerating both the flat and the {type,data} item
+// shapes the endpoint has been seen returning).
+func (s *Lavatop) fetchOfferNames(ctx context.Context) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.apiURL+"/api/v2/products", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(ltAPIKeyHeader, s.apiKey)
+	res, err := s.cl.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	rb, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, errors.Errorf("lavatop products request failed status=%v body=%v", res.StatusCode, string(rb))
+	}
+	return extractOfferNames(rb, s.products)
+}
+
+func extractOfferNames(body []byte, products map[string]bool) ([]string, error) {
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal products response")
+	}
+	items, _ := out["items"].([]any)
+	var names []string
+	for _, it := range items {
+		node, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		if data, ok := node["data"].(map[string]any); ok {
+			node = data
+		}
+		if !products[strings.ToLower(stringField(node, "id"))] {
+			continue
+		}
+		offers, _ := node["offers"].([]any)
+		for _, of := range offers {
+			offer, ok := of.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name := stringField(offer, "name"); name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	if len(names) == 0 {
+		return nil, errors.New("no offers found for the configured lavatop products")
+	}
+	return names, nil
 }
 
 // nestedString walks nested JSON objects and stringField's the final key.

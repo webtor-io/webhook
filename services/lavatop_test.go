@@ -3,7 +3,9 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,13 +52,8 @@ func TestLavatop_ParseProducts(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if len(got) != len(tc.want) {
+			if !maps.Equal(got, tc.want) {
 				t.Fatalf("expected %v, got %v", tc.want, got)
-			}
-			for k, v := range tc.want {
-				if got[k] != v {
-					t.Errorf("expected %v=%v, got %v", k, v, got[k])
-				}
 			}
 		})
 	}
@@ -170,8 +167,12 @@ func TestLavatop_ProcessEventSkips(t *testing.T) {
 			payload: `{"eventType": "payment.success", "product": {"id": "72d53efb-3696-469f-b856-f0d815748dd6"}, "buyer": {"email": "a@b.c"}, "status": "completed"}`,
 		},
 		{
-			name:    "non-success status",
-			payload: `{"eventType": "payment.success", "product": {"id": "72d53efb-3696-469f-b856-f0d815748dd6"}, "buyer": {"email": "a@b.c"}, "contractId": "x", "status": "subscription-failed"}`,
+			name:    "failure status on success event",
+			payload: `{"eventType": "payment.success", "product": {"id": "72d53efb-3696-469f-b856-f0d815748dd6"}, "buyer": {"email": "a@b.c"}, "contractId": "c5a0cacc-3453-44b0-9532-aa492f1ba191", "status": "subscription-failed"}`,
+		},
+		{
+			name:    "non-uuid contract id",
+			payload: `{"eventType": "payment.success", "product": {"id": "72d53efb-3696-469f-b856-f0d815748dd6"}, "buyer": {"email": "a@b.c"}, "contractId": "../products", "status": "completed"}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -192,11 +193,12 @@ func TestLavatop_ProcessEventSkips(t *testing.T) {
 
 func TestLavatop_ExtractContract(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		in        string
-		wantOffer string
-		wantTime  time.Time
-		wantErr   bool
+		name           string
+		in             string
+		wantOffer      string
+		wantTime       time.Time
+		wantTerminated string
+		wantErr        bool
 	}{
 		{
 			name:      "offer and expiry present",
@@ -208,6 +210,13 @@ func TestLavatop_ExtractContract(t *testing.T) {
 			name:      "expiry null",
 			in:        `{"product": {"offer": "Gold Backer"}, "subscriptionDetails": {"expiredAt": null}}`,
 			wantOffer: "Gold Backer",
+		},
+		{
+			name:           "terminated",
+			in:             `{"product": {"offer": "Gold Backer"}, "subscriptionDetails": {"expiredAt": "2024-03-06T08:44:49.123932Z", "terminatedAt": "2024-02-10T00:00:00Z"}}`,
+			wantOffer:      "Gold Backer",
+			wantTime:       time.Date(2024, 3, 6, 8, 44, 49, 123932000, time.UTC),
+			wantTerminated: "2024-02-10T00:00:00Z",
 		},
 		{
 			name: "details and offer absent",
@@ -241,20 +250,74 @@ func TestLavatop_ExtractContract(t *testing.T) {
 			if !got.ExpiredAt.Equal(tc.wantTime) {
 				t.Errorf("expected %v, got %v", tc.wantTime, got.ExpiredAt)
 			}
+			if got.TerminatedAt != tc.wantTerminated {
+				t.Errorf("expected terminatedAt %q, got %q", tc.wantTerminated, got.TerminatedAt)
+			}
 		})
 	}
 }
 
 func TestLavatop_TierName(t *testing.T) {
 	for in, want := range map[string]string{
-		"Bronze Backer": "bronze",
-		"Silver Backer": "silver",
-		"Gold Backer":   "gold",
-		"  gold  ":      "gold",
-		"":              "",
+		"Bronze Backer":       "bronze",
+		"Silver Backer":       "silver",
+		"Gold Backer":         "gold",
+		"  gold  ":            "gold",
+		"Bronze-Backer":       "bronze",
+		"Bronze(RUB) Special": "bronze",
+		"—":                   "",
+		"":                    "",
 	} {
 		if got := lavatopTierName(in); got != want {
 			t.Errorf("lavatopTierName(%q): expected %q, got %q", in, want, got)
 		}
+	}
+}
+
+// Unknown status on a success event must ERROR (5xx → lava retries), never
+// ack-and-drop: money arrived, this build just doesn't know the status yet.
+func TestLavatop_ProcessEventUnknownStatusErrors(t *testing.T) {
+	s := &Lavatop{products: map[string]bool{"72d53efb-3696-469f-b856-f0d815748dd6": true}}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(`{
+		"eventType": "payment.success",
+		"product": {"id": "72d53efb-3696-469f-b856-f0d815748dd6"},
+		"buyer": {"email": "a@b.c"},
+		"contractId": "c5a0cacc-3453-44b0-9532-aa492f1ba191",
+		"status": "subscription-renewed"
+	}`), &payload); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.processEvent(context.Background(), payload); err == nil {
+		t.Error("expected unknown status to error so lava.top retries")
+	}
+}
+
+func TestLavatop_ExtractOfferNames(t *testing.T) {
+	products := map[string]bool{"506cc5ce-3997-40db-84fd-0a6e0d84107f": true}
+	// flat item shape (as observed live)
+	flat := `{"items":[{"id":"506cc5ce-3997-40db-84fd-0a6e0d84107f","title":"Subscription webtor",
+		"offers":[{"id":"1","name":"Bronze Backer"},{"id":"2","name":"Silver Backer"}]},
+		{"id":"aaaaaaaa-0000-0000-0000-000000000000","offers":[{"id":"3","name":"Other"}]}]}`
+	names, err := extractOfferNames([]byte(flat), products)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Join(names, ",") != "Bronze Backer,Silver Backer" {
+		t.Errorf("unexpected names: %v", names)
+	}
+	// spec {type,data} item shape
+	wrapped := `{"items":[{"type":"PRODUCT","data":{"id":"506CC5CE-3997-40db-84fd-0a6e0d84107f",
+		"offers":[{"name":"Gold Backer"}]}}]}`
+	names, err = extractOfferNames([]byte(wrapped), products)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Join(names, ",") != "Gold Backer" {
+		t.Errorf("unexpected names: %v", names)
+	}
+	// no matching products → error
+	if _, err = extractOfferNames([]byte(`{"items":[]}`), products); err == nil {
+		t.Error("expected error for empty items")
 	}
 }
