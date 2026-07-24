@@ -13,44 +13,29 @@ func TestLavatop_ParseProducts(t *testing.T) {
 		name    string
 		in      string
 		wantErr bool
-		want    map[string]int
+		want    map[string]bool
 	}{
 		{
 			name: "empty",
 			in:   "",
-			want: map[string]int{},
+			want: map[string]bool{},
 		},
 		{
 			name: "valid list with spaces and mixed case",
-			in:   "D31384B8-e412-4be5-a2ec-297ae6666c8f:1, 72d53efb-3696-469f-b856-f0d815748dd6:3",
-			want: map[string]int{
-				"d31384b8-e412-4be5-a2ec-297ae6666c8f": 1,
-				"72d53efb-3696-469f-b856-f0d815748dd6": 3,
+			in:   "D31384B8-e412-4be5-a2ec-297ae6666c8f, 72d53efb-3696-469f-b856-f0d815748dd6",
+			want: map[string]bool{
+				"d31384b8-e412-4be5-a2ec-297ae6666c8f": true,
+				"72d53efb-3696-469f-b856-f0d815748dd6": true,
 			},
 		},
 		{
-			name:    "missing tier",
-			in:      "d31384b8-e412-4be5-a2ec-297ae6666c8f",
-			wantErr: true,
-		},
-		{
 			name:    "bad uuid",
-			in:      "not-a-uuid:1",
+			in:      "not-a-uuid",
 			wantErr: true,
 		},
 		{
-			name:    "bad tier",
-			in:      "d31384b8-e412-4be5-a2ec-297ae6666c8f:bronze",
-			wantErr: true,
-		},
-		{
-			name:    "zero tier",
-			in:      "d31384b8-e412-4be5-a2ec-297ae6666c8f:0",
-			wantErr: true,
-		},
-		{
-			name:    "duplicate product",
-			in:      "d31384b8-e412-4be5-a2ec-297ae6666c8f:1,d31384b8-e412-4be5-a2ec-297ae6666c8f:2",
+			name:    "trailing comma",
+			in:      "d31384b8-e412-4be5-a2ec-297ae6666c8f,",
 			wantErr: true,
 		},
 	} {
@@ -151,7 +136,7 @@ func TestLavatop_NestedString(t *testing.T) {
 // processEvent paths that must ack-and-drop before touching the DB or the
 // lava.top API (s.db and s.cl stay nil — a touch would panic the test).
 func TestLavatop_ProcessEventSkips(t *testing.T) {
-	s := &Lavatop{products: map[string]int{"72d53efb-3696-469f-b856-f0d815748dd6": 2}}
+	s := &Lavatop{products: map[string]bool{"72d53efb-3696-469f-b856-f0d815748dd6": true}}
 	for _, tc := range []struct {
 		name    string
 		payload string
@@ -205,24 +190,27 @@ func TestLavatop_ProcessEventSkips(t *testing.T) {
 	}
 }
 
-func TestLavatop_ExtractExpiredAt(t *testing.T) {
+func TestLavatop_ExtractContract(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		in      string
-		want    time.Time
-		wantErr bool
+		name      string
+		in        string
+		wantOffer string
+		wantTime  time.Time
+		wantErr   bool
 	}{
 		{
-			name: "expiry present",
-			in:   `{"id": "c5a0cacc-3453-44b0-9532-aa492f1ba191", "subscriptionDetails": {"expiredAt": "2024-03-06T08:44:49.123932Z"}}`,
-			want: time.Date(2024, 3, 6, 8, 44, 49, 123932000, time.UTC),
+			name:      "offer and expiry present",
+			in:        `{"id": "c5a0cacc-3453-44b0-9532-aa492f1ba191", "product": {"name": "Subscription webtor", "offer": "Bronze Backer"}, "subscriptionDetails": {"expiredAt": "2024-03-06T08:44:49.123932Z"}}`,
+			wantOffer: "Bronze Backer",
+			wantTime:  time.Date(2024, 3, 6, 8, 44, 49, 123932000, time.UTC),
 		},
 		{
-			name: "expiry null",
-			in:   `{"subscriptionDetails": {"expiredAt": null}}`,
+			name:      "expiry null",
+			in:        `{"product": {"offer": "Gold Backer"}, "subscriptionDetails": {"expiredAt": null}}`,
+			wantOffer: "Gold Backer",
 		},
 		{
-			name: "details absent",
+			name: "details and offer absent",
 			in:   `{"id": "c5a0cacc-3453-44b0-9532-aa492f1ba191"}`,
 		},
 		{
@@ -237,7 +225,7 @@ func TestLavatop_ExtractExpiredAt(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := extractExpiredAt([]byte(tc.in))
+			got, err := extractContract([]byte(tc.in))
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got %v", got)
@@ -247,9 +235,26 @@ func TestLavatop_ExtractExpiredAt(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if !got.Equal(tc.want) {
-				t.Errorf("expected %v, got %v", tc.want, got)
+			if got.OfferName != tc.wantOffer {
+				t.Errorf("expected offer %q, got %q", tc.wantOffer, got.OfferName)
+			}
+			if !got.ExpiredAt.Equal(tc.wantTime) {
+				t.Errorf("expected %v, got %v", tc.wantTime, got.ExpiredAt)
 			}
 		})
+	}
+}
+
+func TestLavatop_TierName(t *testing.T) {
+	for in, want := range map[string]string{
+		"Bronze Backer": "bronze",
+		"Silver Backer": "silver",
+		"Gold Backer":   "gold",
+		"  gold  ":      "gold",
+		"":              "",
+	} {
+		if got := lavatopTierName(in); got != want {
+			t.Errorf("lavatopTierName(%q): expected %q, got %q", in, want, got)
+		}
 	}
 }

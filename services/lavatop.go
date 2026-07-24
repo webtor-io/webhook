@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -66,7 +65,7 @@ func RegisterLavatopFlags(f []cli.Flag) []cli.Flag {
 		},
 		cli.StringFlag{
 			Name:   ltProductsFlag,
-			Usage:  "productUUID:tierID comma-separated list mapping lava.top storefront products to tiers",
+			Usage:  "comma-separated uuids of our lava.top storefront products (events for other products are ignored)",
 			Value:  "",
 			EnvVar: "LAVATOP_PRODUCTS",
 		},
@@ -81,11 +80,14 @@ func RegisterLavatopFlags(f []cli.Flag) []cli.Flag {
 
 // Lavatop grants billing.member access from lava.top storefront webhooks.
 // Purchases happen entirely on the lava.top storefront (Patreon-style — there
-// is no invoice/checkout API integration on our side): a success webhook is
-// bound to a tier via the product id and to a user via the buyer email, and
-// the granted period comes from the contract's subscriptionDetails.expiredAt
-// looked up at lava.top. The GREATEST() upsert makes redelivered webhooks
-// converge on the same expiry, so no dedup state is needed.
+// is no invoice/checkout API integration on our side). The subscription tiers
+// are offers of ONE lava.top product, and the webhook payload only carries
+// the product id — so the tier comes from the offer NAME on the contract
+// looked up at lava.top ("Bronze Backer" → tier 'bronze', same first-word
+// convention the patreon.member matview applies to Patreon tier titles), and
+// the granted period from the contract's subscriptionDetails.expiredAt. The
+// GREATEST() upsert makes redelivered webhooks converge on the same expiry,
+// so no dedup state is needed.
 type Lavatop struct {
 	db         *cs.PG
 	nats       *cs.NATS
@@ -93,7 +95,7 @@ type Lavatop struct {
 	apiKey     string
 	webhookKey string
 	apiURL     string
-	products   map[string]int
+	products   map[string]bool
 	graceDays  int
 }
 
@@ -117,31 +119,20 @@ func NewLavatop(c *cli.Context, db *cs.PG, nats *cs.NATS) *Lavatop {
 func (s *Lavatop) Close() {
 }
 
-// parseLavatopProducts parses "productUUID:tierID,..." into a lookup map.
-func parseLavatopProducts(v string) (map[string]int, error) {
-	products := map[string]int{}
+// parseLavatopProducts parses a comma-separated product uuid list into an
+// ours-filter set.
+func parseLavatopProducts(v string) (map[string]bool, error) {
+	products := map[string]bool{}
 	if strings.TrimSpace(v) == "" {
 		return products, nil
 	}
 	for _, entry := range strings.Split(v, ",") {
 		entry = strings.TrimSpace(entry)
-		parts := strings.Split(entry, ":")
-		if len(parts) != 2 {
-			return nil, errors.Errorf("malformed products entry %q", entry)
-		}
-		id, err := uuid.FromString(parts[0])
+		id, err := uuid.FromString(entry)
 		if err != nil {
-			return nil, errors.Wrapf(err, "malformed product uuid in entry %q", entry)
+			return nil, errors.Wrapf(err, "malformed product uuid %q", entry)
 		}
-		tierID, err := strconv.Atoi(parts[1])
-		if err != nil || tierID <= 0 {
-			return nil, errors.Errorf("malformed tier id in entry %q", entry)
-		}
-		key := strings.ToLower(id.String())
-		if _, ok := products[key]; ok {
-			return nil, errors.Errorf("duplicate product %q", key)
-		}
-		products[key] = tierID
+		products[strings.ToLower(id.String())] = true
 	}
 	return products, nil
 }
@@ -251,10 +242,9 @@ var ltSuccessStatuses = map[string]bool{
 
 func (s *Lavatop) processSuccess(ctx context.Context, payload map[string]any) (string, error) {
 	productID := strings.ToLower(nestedString(payload, "product", "id"))
-	tierID, ok := s.products[productID]
-	if !ok {
+	if !s.products[productID] {
 		// Another product on the same lava.top account.
-		log.WithField("product_id", productID).Warn("lavatop event for unmapped product, skipping")
+		log.WithField("product_id", productID).Warn("lavatop event for unknown product, skipping")
 		return "", nil
 	}
 	email := strings.ToLower(strings.TrimSpace(nestedString(payload, "buyer", "email")))
@@ -270,12 +260,18 @@ func (s *Lavatop) processSuccess(ctx context.Context, payload map[string]any) (s
 			Warn("lavatop success event with non-success status, skipping")
 		return "", nil
 	}
-	expireAt, err := s.fetchExpiredAt(ctx, contractID)
+	// 5xx on any failure below → lava.top retries with backoff, which also
+	// rides out the lookup racing the contract becoming visible on their
+	// side. A paid sale must never be ack-and-dropped past this point.
+	contract, err := s.fetchContract(ctx, contractID)
 	if err != nil {
-		// 5xx → lava.top retries with backoff, which also rides out the
-		// lookup racing the contract becoming visible on their side.
 		return "", errors.Wrapf(err, "failed to fetch contract %v", contractID)
 	}
+	tierName := lavatopTierName(contract.OfferName)
+	if tierName == "" {
+		return "", errors.Errorf("contract %v without offer name, cannot resolve tier", contractID)
+	}
+	expireAt := contract.ExpiredAt
 	if expireAt.IsZero() {
 		log.WithField("contract_id", contractID).
 			Warnf("lavatop contract without subscription expiry, granting %d days", ltFallbackDays)
@@ -283,63 +279,93 @@ func (s *Lavatop) processSuccess(ctx context.Context, payload map[string]any) (s
 	}
 	expireAt = expireAt.Add(time.Duration(s.graceDays) * 24 * time.Hour)
 	db := s.db.Get()
-	if _, err := db.ExecContext(ctx, `
+	res, err := db.ExecContext(ctx, `
 		INSERT INTO billing.member (email, tier_id, expire_at, updated_at)
-		VALUES (?, ?, ?, now())
+		SELECT ?, t.tier_id, ?, now() FROM tier t WHERE t.name = ?
 		ON CONFLICT (email, tier_id) DO UPDATE
 		SET expire_at = GREATEST(billing.member.expire_at, EXCLUDED.expire_at),
 		    updated_at = now()
-	`, email, tierID, expireAt); err != nil {
+	`, email, expireAt, tierName)
+	if err != nil {
 		return "", errors.Wrap(err, "failed to upsert member")
+	}
+	if res.RowsAffected() == 0 {
+		// The offer name doesn't resolve to a tier (renamed in the lava.top
+		// dashboard?) — fail loudly, lava.top keeps retrying meanwhile.
+		return "", errors.Errorf("no tier named %q for contract %v offer %q", tierName, contractID, contract.OfferName)
 	}
 	log.WithField("contract_id", contractID).
 		WithField("email", email).
-		WithField("tier_id", tierID).
+		WithField("tier", tierName).
 		WithField("expire_at", expireAt).
 		Info("lavatop membership granted")
 	return email, nil
 }
 
-// fetchExpiredAt looks the contract up at lava.top and returns its
-// subscriptionDetails.expiredAt (zero time when the contract carries none).
-func (s *Lavatop) fetchExpiredAt(ctx context.Context, contractID string) (time.Time, error) {
+// lavatopTierName maps an offer name to a tier table name by its first word —
+// "Bronze Backer" → "bronze" — the same convention the patreon.member matview
+// applies to Patreon tier titles (see manual_ddl_snapshot.sql).
+func lavatopTierName(offerName string) string {
+	fields := strings.Fields(offerName)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToLower(fields[0])
+}
+
+// lavatopContract is what we need from an InvoiceResponseV2/V3 contract.
+type lavatopContract struct {
+	// OfferName is product.offer — the subscription level, e.g. "Bronze Backer".
+	OfferName string
+	// ExpiredAt is subscriptionDetails.expiredAt; zero when the contract
+	// carries none (one-time product).
+	ExpiredAt time.Time
+}
+
+// fetchContract looks the contract up at lava.top.
+func (s *Lavatop) fetchContract(ctx context.Context, contractID string) (*lavatopContract, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("%v/api/v2/invoices/%v", s.apiURL, contractID), nil)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
 	req.Header.Set(ltAPIKeyHeader, s.apiKey)
 	res, err := s.cl.Do(req)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
 	defer res.Body.Close()
 	rb, err := io.ReadAll(res.Body)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
 	if res.StatusCode != http.StatusOK {
-		return time.Time{}, errors.Errorf("lavatop contract request failed status=%v body=%v", res.StatusCode, string(rb))
+		return nil, errors.Errorf("lavatop contract request failed status=%v body=%v", res.StatusCode, string(rb))
 	}
-	return extractExpiredAt(rb)
+	return extractContract(rb)
 }
 
-// extractExpiredAt pulls subscriptionDetails.expiredAt out of an
-// InvoiceResponseV3 body; absent/null yields a zero time without error.
-func extractExpiredAt(body []byte) (time.Time, error) {
+// extractContract pulls the offer name and subscriptionDetails.expiredAt out
+// of a contract response body; an absent/null expiry yields a zero time
+// without error.
+func extractContract(body []byte) (*lavatopContract, error) {
 	var out map[string]any
 	if err := json.Unmarshal(body, &out); err != nil {
-		return time.Time{}, errors.Wrapf(err, "failed to unmarshal contract response=%v", string(body))
+		return nil, errors.Wrapf(err, "failed to unmarshal contract response=%v", string(body))
+	}
+	c := &lavatopContract{
+		OfferName: nestedString(out, "product", "offer"),
 	}
 	v := nestedString(out, "subscriptionDetails", "expiredAt")
 	if v == "" {
-		return time.Time{}, nil
+		return c, nil
 	}
 	t, err := time.Parse(time.RFC3339Nano, v)
 	if err != nil {
-		return time.Time{}, errors.Wrapf(err, "failed to parse contract expiredAt=%v", v)
+		return nil, errors.Wrapf(err, "failed to parse contract expiredAt=%v", v)
 	}
-	return t, nil
+	c.ExpiredAt = t
+	return c, nil
 }
 
 // nestedString walks nested JSON objects and stringField's the final key.
