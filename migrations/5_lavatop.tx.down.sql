@@ -1,0 +1,1 @@
+DROP SCHEMA lavatop CASCADE;

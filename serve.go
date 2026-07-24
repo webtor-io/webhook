@@ -23,6 +23,7 @@ func configureServe(c *cli.Command) {
 	c.Flags = cs.RegisterProbeFlags(c.Flags)
 	c.Flags = s.RegisterPatreonFlags(c.Flags)
 	c.Flags = s.RegisterNowPaymentsFlags(c.Flags)
+	c.Flags = s.RegisterLavatopFlags(c.Flags)
 	c.Flags = cs.RegisterNATSFlags(c.Flags)
 	c.Flags = cs.RegisterPGFlags(c.Flags)
 }
@@ -66,6 +67,13 @@ func serve(c *cli.Context) error {
 
 	// Registering the NOWPayments IPN receiver (public, like /patreon)
 	web.RegisterProvider("/nowpayments", np.HandleIPN)
+
+	// Setting lava.top (storefront purchases: webhooks only, no invoice API)
+	lt := s.NewLavatop(c, db, nats)
+	defer lt.Close()
+
+	// Registering the lava.top webhook receiver (public, like /patreon)
+	web.RegisterProvider("/lavatop", lt.HandleWebhook)
 
 	// Setting the provider-agnostic invoice API (cluster-only: the ingress
 	// path whitelist is what keeps these routes off the internet)
