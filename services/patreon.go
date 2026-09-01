@@ -151,13 +151,13 @@ func (s *Patreon) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 	log.WithField("message", m).Info("message stored")
 	w.WriteHeader(http.StatusOK)
-	s.scheduleRefreshAndPublish(p)
+	s.scheduleRefreshAndPublish(p, event)
 }
 
 // scheduleRefreshAndPublish queues a background refresh of patreon.member and
 // publishes user.updated once the refresh completes. Concurrent calls coalesce
 // into at most one running + one pending refresh.
-func (s *Patreon) scheduleRefreshAndPublish(p mp.Payload) {
+func (s *Patreon) scheduleRefreshAndPublish(p mp.Payload, event string) {
 	done := make(chan struct{})
 
 	s.refreshMu.Lock()
@@ -171,7 +171,7 @@ func (s *Patreon) scheduleRefreshAndPublish(p mp.Payload) {
 	}
 	go func() {
 		<-done
-		s.publish(p)
+		s.publish(p, event)
 	}()
 }
 
@@ -298,24 +298,45 @@ func (s *Patreon) refreshMembers(ctx context.Context, wait bool) (bool, error) {
 	return true, nil
 }
 
-func (s *Patreon) publish(p mp.Payload) {
-	publishUserUpdated(s.nats, s.getEmail(p))
+func (s *Patreon) publish(p mp.Payload, event string) {
+	publishUserUpdated(s.nats, userUpdatedFromPatreon(p, event))
+}
+
+// userUpdatedFromPatreon lifts the membership facts a consumer may act on
+// out of the raw webhook payload. Missing or oddly typed attributes are
+// simply left empty — the payload is Patreon's to shape, and the event must
+// still go out for the email alone.
+func userUpdatedFromPatreon(p mp.Payload, event string) UserUpdated {
+	attrs := patreonAttrs(p)
+	msg := UserUpdated{
+		Email:          stringAttr(attrs, "email"),
+		Source:         "patreon",
+		Event:          event,
+		PatronStatus:   stringAttr(attrs, "patron_status"),
+		NextChargeDate: stringAttr(attrs, "next_charge_date"),
+	}
+	if v, ok := attrs["is_free_trial"].(bool); ok {
+		msg.IsFreeTrial = &v
+	}
+	return msg
+}
+
+func patreonAttrs(p mp.Payload) map[string]interface{} {
+	data, ok := p["data"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	attrs, _ := data["attributes"].(map[string]interface{})
+	return attrs
+}
+
+func stringAttr(attrs map[string]interface{}, key string) string {
+	v, _ := attrs[key].(string)
+	return v
 }
 
 func (s *Patreon) getEmail(p mp.Payload) string {
-	data, ok := p["data"].(map[string]interface{})
-	if !ok {
-		return ""
-	}
-	attrs, ok := data["attributes"].(map[string]interface{})
-	if !ok {
-		return ""
-	}
-	email, ok := attrs["email"].(string)
-	if !ok {
-		return ""
-	}
-	return email
+	return stringAttr(patreonAttrs(p), "email")
 }
 
 func (s *Patreon) Close() {

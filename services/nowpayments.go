@@ -348,7 +348,7 @@ func (s *NowPayments) CreateInvoice(ctx context.Context, p *mb.Payment, tierName
 }
 
 func (s *NowPayments) publish(email string) {
-	publishUserUpdated(s.nats, email)
+	publishUserUpdated(s.nats, UserUpdated{Email: email, Source: "crypto"})
 }
 
 // validate checks x-nowpayments-sig: HMAC-SHA512 over the callback body
