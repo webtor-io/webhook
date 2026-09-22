@@ -29,7 +29,7 @@ type InvoiceProvider interface {
 //
 //	PUT /invoice/{id}   create (idempotent — the caller supplies the uuid)
 //	GET /invoice/{id}   payment state
-//	GET /prices         purchasable plans
+//	GET /prices         storefront catalog: plans on sale + what each tier grants
 //
 // There is deliberately no auth here, matching the other cluster-internal
 // webtor services. The ONLY thing keeping these routes off the internet is
@@ -263,8 +263,13 @@ func (s *Invoice) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, listInvoicesResponse{Invoices: items})
 }
 
+// listPricesResponse is the storefront catalog: the plans on sale (prices)
+// and what each tier grants (tiers). Tier facts are listed once per tier
+// rather than on every price row, and include tiers with no price — free is
+// what a free user is offered an upgrade from.
 type listPricesResponse struct {
 	Prices []priceItem `json:"prices"`
+	Tiers  []tierItem  `json:"tiers"`
 }
 
 type priceItem struct {
@@ -273,23 +278,67 @@ type priceItem struct {
 	PeriodDays int     `json:"period_days" pg:"period_days"`
 	AmountUSD  float64 `json:"amount_usd" pg:"amount_usd"`
 	Available  bool    `json:"available" pg:"available"`
+	// TrialDays > 0: the plan can be started with a free trial this long.
+	TrialDays int `json:"trial_days" pg:"trial_days"`
+	// IsPromo: the plan in-app offers sell; at most one.
+	IsPromo bool `json:"is_promo" pg:"is_promo"`
 }
 
-func (s *Invoice) handlePrices(w http.ResponseWriter, r *http.Request) {
-	db := s.db.Get()
-	var items []priceItem
-	_, err := db.Query(&items, `
-		SELECT p.tier_id, t.name AS tier_name, p.period_days, p.amount_usd, p.available
+// tierItem mirrors the tier columns the claims are built from, so an offer
+// quotes exactly what the plan grants. A nil rate or Vault Points value is
+// "unlimited" (NULL in the tier table), not zero.
+type tierItem struct {
+	TierID       int    `json:"tier_id" pg:"tier_id"`
+	Name         string `json:"name" pg:"name"`
+	DownloadRate *int64 `json:"download_rate" pg:"download_rate"`
+	VaultPoints  *int64 `json:"vault_points" pg:"vault_points"`
+	SiteNoAds    bool   `json:"site_noads" pg:"site_noads"`
+	EmbedNoAds   bool   `json:"embed_noads" pg:"embed_noads"`
+}
+
+const (
+	selectPricesSQL = `
+		SELECT p.tier_id, t.name AS tier_name, p.period_days, p.amount_usd, p.available,
+		       p.trial_days, p.is_promo
 		FROM price p
 		JOIN tier t ON t.tier_id = p.tier_id
 		ORDER BY p.tier_id, p.period_days
-	`)
-	if err != nil {
+	`
+	selectTiersSQL = `
+		SELECT tier_id, name, download_rate, vault_points, site_noads, embed_noads
+		FROM tier
+		ORDER BY tier_id
+	`
+)
+
+func (s *Invoice) handlePrices(w http.ResponseWriter, r *http.Request) {
+	db := s.db.Get()
+	var prices []priceItem
+	if _, err := db.QueryContext(r.Context(), &prices, selectPricesSQL); err != nil {
 		log.WithError(err).Error("failed to select prices")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, listPricesResponse{Prices: items})
+	var tiers []tierItem
+	if _, err := db.QueryContext(r.Context(), &tiers, selectTiersSQL); err != nil {
+		log.WithError(err).Error("failed to select tiers")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, newListPricesResponse(prices, tiers))
+}
+
+// newListPricesResponse keeps both lists as JSON arrays even when empty: a
+// consumer reads a missing "tiers" key as "this webhook predates the tier
+// catalog", so an empty table must not look like that.
+func newListPricesResponse(prices []priceItem, tiers []tierItem) listPricesResponse {
+	if prices == nil {
+		prices = []priceItem{}
+	}
+	if tiers == nil {
+		tiers = []tierItem{}
+	}
+	return listPricesResponse{Prices: prices, Tiers: tiers}
 }
 
 // tierName resolves the display name from the manually-managed tier table;

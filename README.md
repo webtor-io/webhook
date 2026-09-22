@@ -25,7 +25,27 @@ request (`"provider": "nowpayments"` for now, dispatched via the
   `period_days`; the amount always comes from the `price` table.
 - `GET /invoice/{id}` — payment state.
 - `GET /invoices?user_id=` — one user's payment history, newest first.
-- `GET /prices` — purchasable (tier, period, amount) plans.
+- `GET /prices` — the storefront catalog, read by web-ui to build every offer
+  (tier cards, in-app upsells):
+  - `prices` — plans on sale, one per (tier, period): `amount_usd`,
+    `available`, and the offer terms `trial_days` (> 0 = the plan starts with
+    a free trial of that length; 0 = no trial) and `is_promo` (the one plan
+    in-app offers sell and the storefront recommends; a partial unique index
+    allows at most one). Offer terms are how a plan is sold and live on
+    `price`; what a tier grants lives on `tier`.
+  - `tiers` — what each tier grants, including tiers without a price (free):
+    `download_rate` (Mbit/s), `vault_points`, `site_noads`, `embed_noads`,
+    the same columns the claims are built from. `null` rate or Vault Points
+    = unlimited. Both lists are always arrays; a missing `tiers` key means a
+    webhook older than the catalog.
+
+  The promo index is checked per row, so move the promo in two statements —
+  `UPDATE price SET is_promo = false WHERE is_promo;` then set it on the new
+  plan; a single statement that clears and sets at once can abort on the index
+  depending on row order.
+
+  `trial_days` states what the storefront may promise — the trial itself is
+  configured at the membership provider, change both together.
 
 These routes carry no auth (cluster-internal, matching the other webtor
 services) — the ingress path whitelist, which covers only the receivers
