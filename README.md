@@ -36,8 +36,17 @@ request (`"provider": "nowpayments"` for now, dispatched via the
   - `tiers` — what each tier grants, including tiers without a price (free):
     `download_rate` (Mbit/s), `vault_points`, `site_noads`, `embed_noads`,
     the same columns the claims are built from. `null` rate or Vault Points
-    = unlimited. Both lists are always arrays; a missing `tiers` key means a
-    webhook older than the catalog.
+    = unlimited.
+  - `discounts` — discount codes the membership provider honours right now
+    (`expires_at` in the future): `code`, `percent_off`, `period_days` (the
+    plan length whose first billing period is discounted, same units as
+    `price.period_days`: 30 = first month, 365 = first year of a new
+    membership, on every tier) and `expires_at`. The code is typed in at the provider's checkout (Patreon
+    gives no link that carries it). web-ui hands a code out only while it has
+    at least 72 h left.
+
+  Every list is always an array; a missing key means a webhook older than
+  that part of the catalog.
 
   The promo index is checked per row, so move the promo in two statements —
   `UPDATE price SET is_promo = false WHERE is_promo;` then set it on the new
@@ -46,6 +55,18 @@ request (`"provider": "nowpayments"` for now, dispatched via the
 
   `trial_days` states what the storefront may promise — the trial itself is
   configured at the membership provider, change both together.
+
+  A discount code is created at the provider first, then recorded here. The
+  row states what the letter may promise, so it must match the provider's
+  settings exactly; `expires_at` is the moment the provider stops honouring
+  the code (Patreon codes live at most 180 days):
+
+  ```sql
+  INSERT INTO discount (code, percent_off, period_days, expires_at)
+  VALUES ('<code>', 50, 30, '2027-03-22 00:00+03');
+  ```
+
+  To withdraw a code early, move its `expires_at` to now; keep the row.
 
 These routes carry no auth (cluster-internal, matching the other webtor
 services) — the ingress path whitelist, which covers only the receivers

@@ -29,7 +29,7 @@ type InvoiceProvider interface {
 //
 //	PUT /invoice/{id}   create (idempotent — the caller supplies the uuid)
 //	GET /invoice/{id}   payment state
-//	GET /prices         storefront catalog: plans on sale + what each tier grants
+//	GET /prices         storefront catalog: plans on sale, what each tier grants, live discount codes
 //
 // There is deliberately no auth here, matching the other cluster-internal
 // webtor services. The ONLY thing keeping these routes off the internet is
@@ -263,13 +263,15 @@ func (s *Invoice) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, listInvoicesResponse{Invoices: items})
 }
 
-// listPricesResponse is the storefront catalog: the plans on sale (prices)
-// and what each tier grants (tiers). Tier facts are listed once per tier
-// rather than on every price row, and include tiers with no price — free is
-// what a free user is offered an upgrade from.
+// listPricesResponse is the storefront catalog: the plans on sale (prices),
+// what each tier grants (tiers) and the discount codes the provider honours
+// right now (discounts). Tier facts are listed once per tier rather than on
+// every price row, and include tiers with no price — free is what a free user
+// is offered an upgrade from.
 type listPricesResponse struct {
-	Prices []priceItem `json:"prices"`
-	Tiers  []tierItem  `json:"tiers"`
+	Prices    []priceItem    `json:"prices"`
+	Tiers     []tierItem     `json:"tiers"`
+	Discounts []discountItem `json:"discounts"`
 }
 
 type priceItem struct {
@@ -296,6 +298,17 @@ type tierItem struct {
 	EmbedNoAds   bool   `json:"embed_noads" pg:"embed_noads"`
 }
 
+// discountItem is a live discount code: percent off the first billing period
+// of a new membership on any tier — PeriodDays is that plan length, as in
+// price.period_days (30 or 365) — until ExpiresAt. The code is typed in at
+// the provider's checkout.
+type discountItem struct {
+	Code       string    `json:"code" pg:"code"`
+	PercentOff int       `json:"percent_off" pg:"percent_off"`
+	PeriodDays int       `json:"period_days" pg:"period_days"`
+	ExpiresAt  time.Time `json:"expires_at" pg:"expires_at"`
+}
+
 const (
 	selectPricesSQL = `
 		SELECT p.tier_id, t.name AS tier_name, p.period_days, p.amount_usd, p.available,
@@ -308,6 +321,14 @@ const (
 		SELECT tier_id, name, download_rate, vault_points, site_noads, embed_noads
 		FROM tier
 		ORDER BY tier_id
+	`
+	// Live codes only, the one with the most time left first. An expired
+	// row stays in the table as history but must never reach an offer.
+	selectDiscountsSQL = `
+		SELECT code, percent_off, period_days, expires_at
+		FROM discount
+		WHERE expires_at > now()
+		ORDER BY expires_at DESC, code
 	`
 )
 
@@ -325,20 +346,29 @@ func (s *Invoice) handlePrices(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, newListPricesResponse(prices, tiers))
+	var discounts []discountItem
+	if _, err := db.QueryContext(r.Context(), &discounts, selectDiscountsSQL); err != nil {
+		log.WithError(err).Error("failed to select discounts")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, newListPricesResponse(prices, tiers, discounts))
 }
 
-// newListPricesResponse keeps both lists as JSON arrays even when empty: a
-// consumer reads a missing "tiers" key as "this webhook predates the tier
+// newListPricesResponse keeps every list a JSON array even when empty: a
+// consumer reads a missing key as "this webhook predates that part of the
 // catalog", so an empty table must not look like that.
-func newListPricesResponse(prices []priceItem, tiers []tierItem) listPricesResponse {
+func newListPricesResponse(prices []priceItem, tiers []tierItem, discounts []discountItem) listPricesResponse {
 	if prices == nil {
 		prices = []priceItem{}
 	}
 	if tiers == nil {
 		tiers = []tierItem{}
 	}
-	return listPricesResponse{Prices: prices, Tiers: tiers}
+	if discounts == nil {
+		discounts = []discountItem{}
+	}
+	return listPricesResponse{Prices: prices, Tiers: tiers, Discounts: discounts}
 }
 
 // tierName resolves the display name from the manually-managed tier table;

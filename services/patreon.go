@@ -309,14 +309,20 @@ func (s *Patreon) publish(p mp.Payload, event string) {
 func userUpdatedFromPatreon(p mp.Payload, event string) UserUpdated {
 	attrs := patreonAttrs(p)
 	msg := UserUpdated{
-		Email:          stringAttr(attrs, "email"),
-		Source:         "patreon",
-		Event:          event,
-		PatronStatus:   stringAttr(attrs, "patron_status"),
-		NextChargeDate: stringAttr(attrs, "next_charge_date"),
+		Email:            stringAttr(attrs, "email"),
+		Source:           "patreon",
+		Event:            event,
+		PatronStatus:     stringAttr(attrs, "patron_status"),
+		NextChargeDate:   stringAttr(attrs, "next_charge_date"),
+		LastChargeStatus: stringAttr(attrs, "last_charge_status"),
 	}
 	if v, ok := attrs["is_free_trial"].(bool); ok {
 		msg.IsFreeTrial = &v
+	}
+	// encoding/json decodes a number in a map[string]interface{} as float64.
+	if v, ok := attrs["campaign_lifetime_support_cents"].(float64); ok {
+		cents := int(v)
+		msg.LifetimeSupportCents = &cents
 	}
 	return msg
 }

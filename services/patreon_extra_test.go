@@ -68,6 +68,34 @@ func TestUserUpdatedFromPatreon(t *testing.T) {
 	}
 }
 
+// A failed first charge is told from a failed renewal by lifetime support:
+// 0 must arrive as a known 0, not be dropped as a zero value. The payload is
+// decoded from JSON here, as in Handle, so the number is a float64 in the map.
+func TestUserUpdatedFromPatreon_DeclinedFirstCharge(t *testing.T) {
+	var p mp.Payload
+	raw := `{"data":{"attributes":{"email":"u@example.com","patron_status":"declined_patron",` +
+		`"last_charge_status":"Declined","campaign_lifetime_support_cents":0}}}`
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatal(err)
+	}
+	msg := userUpdatedFromPatreon(p, "members:update")
+	if msg.PatronStatus != "declined_patron" || msg.LastChargeStatus != "Declined" {
+		t.Errorf("charge fields: %+v", msg)
+	}
+	if msg.LifetimeSupportCents == nil || *msg.LifetimeSupportCents != 0 {
+		t.Fatalf("lifetime support must be a known 0: %+v", msg)
+	}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"email":"u@example.com","source":"patreon","event":"members:update","patron_status":"declined_patron",` +
+		`"last_charge_status":"Declined","lifetime_support_cents":0}`
+	if string(b) != want {
+		t.Errorf("wire format:\n got %s\nwant %s", b, want)
+	}
+}
+
 // The wire format must stay a superset of the old {"email"}: consumers that
 // decode only Email keep working, and absent facts are omitted rather than
 // sent as zero values a consumer could mistake for knowledge.

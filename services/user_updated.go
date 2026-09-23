@@ -27,6 +27,14 @@ type UserUpdated struct {
 	// NextChargeDate is Patreon's next_charge_date verbatim (RFC 3339
 	// timestamp string); empty when absent.
 	NextChargeDate string `json:"next_charge_date,omitempty"`
+	// LastChargeStatus is Patreon's last_charge_status (Paid, Declined,
+	// Fraud, …); empty when absent.
+	LastChargeStatus string `json:"last_charge_status,omitempty"`
+	// LifetimeSupportCents is Patreon's campaign_lifetime_support_cents:
+	// what the member has actually paid this campaign. 0 means no charge has
+	// ever gone through — the one fact that tells a failed FIRST charge (the
+	// end of a trial) from a failed renewal. nil when unknown.
+	LifetimeSupportCents *int `json:"lifetime_support_cents,omitempty"`
 }
 
 // publishUserUpdated emits the user.updated event every membership source
